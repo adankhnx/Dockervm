@@ -1,11 +1,12 @@
 # Use an official Python runtime as a parent image
 FROM python:3.9-slim
 
-# Install system dependencies for building Python packages (netifaces)
+# Install system dependencies for building Python packages and other tools
 RUN apt-get update && apt-get install -y \
     build-essential \
     python3-dev \
     libffi-dev \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Set the working directory in the container
@@ -24,4 +25,5 @@ EXPOSE 8080
 ENV STORAGE_DIR=/app/storage
 ENV PORT=8080
 
+# Start the application
 CMD ["python", "app.py"]
