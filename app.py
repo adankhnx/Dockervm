@@ -9,6 +9,7 @@ import netifaces
 import threading
 import time
 from datetime import datetime
+import ipaddress  # <-- Added import for isBehindNat
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.DEBUG)
@@ -31,6 +32,30 @@ def normalize_ip(ip):
     if ip.startswith("::ffff:"):
         return ip.replace("::ffff:", "")
     return ip
+
+def ip_reach(ip):
+    """
+    Test if the given IP is reachable by making a GET request to the node’s root endpoint.
+    Returns True if the request is successful, False otherwise.
+    """
+    test_url = f"http://{format_ip_for_url(ip)}:{PORT}/"
+    try:
+        r = requests.get(test_url, timeout=3)
+        app.logger.debug(f"Reachability test for {ip}: {r.status_code}")
+        return r.status_code == 200
+    except Exception as e:
+        app.logger.exception(f"Reachability test failed for {ip}:")
+        return False
+
+def isBehindNat(ip):
+    """
+    Determines if the given IP address is likely behind NAT by checking if it's private.
+    """
+    try:
+        return ipaddress.ip_address(ip).is_private
+    except ValueError:
+        app.logger.error(f"Invalid IP address provided to isBehindNat: {ip}")
+        return False
 
 # ==================== IP Address & Role Determination ====================
 def get_ipv4_addresses():
@@ -121,7 +146,6 @@ app.logger.debug(f"Determined node role: {ROLE}")
 PORT = int(os.environ.get("PORT", 8080))
 STORAGE_DIR = os.environ.get("STORAGE_DIR", "./storage")
 
-# Supabase settings (update with your actual values)
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://your-project.supabase.co/rest/v1/users")
 SUPABASE_API_KEY = os.environ.get("SUPABASE_API_KEY", "your_supabase_api_key")
 NODE_NICKNAME = os.environ.get("NODE_NICKNAME", "FlaskNode")
@@ -146,8 +170,20 @@ else:
 # Global variable for Adept's shard count.
 adept_shard_count = 0
 
+# Global job queue for Relay nodes.
+job_queue = []
+job_queue_lock = threading.Lock()
+
+def safe_append_job(job):
+    with job_queue_lock:
+        job_queue.append(job)
+
+def safe_get_jobs_for_target(target_id):
+    with job_queue_lock:
+        return [job for job in job_queue if job["targetNodeId"] == target_id]
+
+# ==================== Shard Count / Supabase Registration ====================
 def update_shard_count_in_supabase():
-    """Update the shard_count field for this node in Supabase."""
     data = {"shard_count": adept_shard_count}
     headers = {
         "apikey": SUPABASE_API_KEY,
@@ -168,19 +204,24 @@ def update_shard_count_in_supabase():
 def register_node_in_supabase():
     app.logger.info(">> Starting Supabase registration")
     app.logger.info(f"SUPABASE_URL: {SUPABASE_URL}, SUPABASE_API_KEY: {SUPABASE_API_KEY}")
-
     public_ipv4, public_ipv6 = get_public_ips()
+    reachable = False
+    behind_nat = False
+    if public_ipv4 and public_ipv4 != "Unknown":
+        reachable = ip_reach(public_ipv4)
+        behind_nat = isBehindNat(public_ipv4)
+    incoming = reachable and not behind_nat
     data = {
         "id": NODE_ID,
         "nickname": NODE_NICKNAME,
         "role": ROLE.capitalize(),
         "ipv4": public_ipv4,
         "ipv6": public_ipv6,
+        "incoming": incoming,
         "locked_parameter": "InitialConfig",
         "active": True,
         "shard_count": adept_shard_count
     }
-
     app.logger.info(f"Registering node in Supabase with data: {data}")
     headers = {
         "apikey": SUPABASE_API_KEY,
@@ -203,6 +244,7 @@ def register_node_in_supabase():
             patch_data = {
                 "ipv4": public_ipv4,
                 "ipv6": public_ipv6,
+                "incoming": incoming,
                 "active": True,
                 "shard_count": adept_shard_count
             }
@@ -217,13 +259,9 @@ def register_node_in_supabase():
     except Exception as e:
         app.logger.exception("Exception during Supabase registration:")
 
-register_node_in_supabase()
-
-# ==================== Query Peers from Supabase & Registration with Them ====================
+# Instead of calling register_node_in_supabase() here, we move it to the main guard.
+# ==================== Query Peers and Register with Them ====================
 def query_peers_from_supabase(peer_role):
-    """
-    Query Supabase for all nodes with a given role.
-    """
     try:
         headers = {"apikey": SUPABASE_API_KEY}
         url = SUPABASE_URL + f"?role=eq.{peer_role.capitalize()}"
@@ -243,10 +281,6 @@ def query_peers_from_supabase(peer_role):
 registered_peers = []
 
 def register_with_peers():
-    """
-    If this node is Relay, register with Adept nodes.
-    If this node is Adept, register with Relay nodes.
-    """
     global registered_peers
     target_role = "adept" if ROLE.lower() == "relay" else "relay"
     app.logger.info(f"Attempting to register with {target_role} nodes.")
@@ -256,22 +290,16 @@ def register_with_peers():
         if not peer_id:
             app.logger.warning("Peer without an id found; skipping.")
             continue
-
-        # Skip self-registration.
         if peer_id == NODE_ID:
             app.logger.debug(f"Skipping self-registration for node {peer_id}")
             continue
-
-        # Use IPv6 if available; otherwise, fall back to IPv4.
         if ":" in get_preferred_ip():
             peer_ip = peer.get("ipv6") if peer.get("ipv6") else peer.get("ipv4")
         else:
             peer_ip = peer.get("ipv4")
-
         if peer_ip and peer_id:
             try:
                 url = f"http://{format_ip_for_url(peer_ip)}:{PORT}/registerPeer"
-                # Updated payload: include both ipv4 and ipv6
                 public_ipv4, public_ipv6 = get_public_ips()
                 payload = {
                     "id": NODE_ID,
@@ -297,20 +325,16 @@ if ROLE.lower() in ["adept", "relay"]:
 # ==================== DHT Manager ====================
 class DHTManager:
     def __init__(self):
-        # Mapping: shard_id -> {"owner": owner_uuid, "distributed_to": [peer_uuid, ...]}
         self.shard_map = {}
-        # Mapping: node UUID -> dictionary with "ipv4" and "ipv6" addresses.
         self.node_map = {}
-        # List of peer node UUIDs (only peers of the opposite type are stored)
         self.peer_nodes = []
         self.current_peer_index = 0
 
-    def register_node(self, uuid_val, ipv4, ipv6, role):
+    def register_node(self, uuid_val, ipv4, ipv6, role, incoming=False):
         ipv4 = normalize_ip(ipv4)
         ipv6 = normalize_ip(ipv6)
-        self.node_map[uuid_val] = {"ipv4": ipv4, "ipv6": ipv6}
-        app.logger.debug(f"[DHTManager] Added/Updated node {uuid_val} in node_map: {{'ipv4': {ipv4}, 'ipv6': {ipv6}}}")
-        # Only add to peer_nodes if the registering role is opposite to our own.
+        self.node_map[uuid_val] = {"ipv4": ipv4, "ipv6": ipv6, "incoming": incoming}
+        app.logger.debug(f"[DHTManager] Added/Updated node {uuid_val}: {{'ipv4': {ipv4}, 'ipv6': {ipv6}, 'incoming': {incoming}}}")
         if ROLE.lower() == "relay" and role.lower() == "adept":
             if uuid_val not in self.peer_nodes:
                 self.peer_nodes.insert(0, uuid_val)
@@ -359,20 +383,50 @@ class DHTManager:
 
 dht_manager = DHTManager()
 
-# Register the local node in the DHT.
-local_ipv4, local_ipv6 = get_public_ips()
-if ROLE.lower() == "adept":
-    dht_manager.register_node(NODE_ID, local_ipv4, local_ipv6, "adept")
-else:  # ROLE == relay
-    dht_manager.register_node(NODE_ID, local_ipv4, local_ipv6, "relay")
-dht_manager.log_state()
+@app.route("/registerPeer", methods=["POST"])
+def register_peer():
+    data = request.get_json()
+    if not data or "id" not in data:
+        app.logger.error("Missing 'id' in /registerPeer payload.")
+        return jsonify({"error": "Missing 'id' in payload"}), 400
+    node_id = data["id"]
+    role_from_payload = data.get("role", "").lower()
+    ip_address = normalize_ip(data.get("ipv4", request.remote_addr))
+    ipv6_address = normalize_ip(data.get("ipv6", ""))
+    incoming = ip_reach(ip_address)
+    app.logger.debug(f"/registerPeer received payload: {data} (normalized ipv4: {ip_address}, ipv6: {ipv6_address}, incoming: {incoming})")
+
+    if ROLE.lower() == "relay" and role_from_payload == "adept":
+        dht_manager.register_node(node_id, ip_address, ipv6_address, role_from_payload, incoming)
+        app.logger.info(f"Registered adept peer {node_id} with IPs {{'ipv4': {ip_address}, 'ipv6': {ipv6_address}, 'incoming': {incoming}}} in DHT.")
+    elif ROLE.lower() == "adept" and role_from_payload == "relay":
+        dht_manager.register_node(node_id, ip_address, ipv6_address, role_from_payload, incoming)
+        app.logger.info(f"Registered relay peer {node_id} with IPs {{'ipv4': {ip_address}, 'ipv6': {ipv6_address}, 'incoming': {incoming}}} in DHT.")
+    else:
+        app.logger.info(f"Node {node_id} with role {role_from_payload} not added to our DHT (our role: {ROLE}).")
+    
+    if ROLE.lower() == "relay" and role_from_payload == "adept" and not request.headers.get("X-RelayBroadcast"):
+        app.logger.debug(f"Initiating broadcast of adept peer {node_id} from relay node.")
+        broadcast_peer_to_peers(node_id, ip_address)
+    elif ROLE.lower() == "adept" and role_from_payload == "relay" and not request.headers.get("X-RelayBroadcast"):
+        app.logger.debug(f"Initiating broadcast of relay peer {node_id} from adept node.")
+        broadcast_peer_to_peers(node_id, ip_address)
+    
+    return jsonify({"status": "success", "message": f"Peer {node_id} registered."}), 200
+
+@app.route("/pendingJobs", methods=["GET"], endpoint="pending_jobs_v2")
+def pending_jobs():
+    target_id = request.args.get("targetId")
+    if not target_id:
+        app.logger.error("Missing 'targetId' query parameter in /pendingJobs.")
+        return jsonify({"error": "Missing 'targetId' query parameter"}), 400
+    if ROLE.lower() != "relay":
+        return jsonify({"error": "Not a relay node"}), 403
+    jobs_for_target = safe_get_jobs_for_target(target_id)
+    return jsonify({"jobs": jobs_for_target}), 200
 
 # ==================== Broadcast Functionality for Peers ====================
 def broadcast_peer_to_peers(peer_id, peer_ip):
-    """
-    For a Relay node: broadcast the newly registered adept to other peers.
-    For an Adept node: broadcast the newly registered relay to other peers.
-    """
     target_role = "adept" if ROLE.lower() == "relay" else "relay"
     app.logger.info(f"Broadcasting {target_role} {peer_id} to all peers from node {NODE_ID}.")
     peers = query_peers_from_supabase(target_role)
@@ -381,21 +435,15 @@ def broadcast_peer_to_peers(peer_id, peer_ip):
         if not p_id:
             app.logger.warning("Encountered a peer without an id during broadcast; skipping.")
             continue
-
-        # Avoid sending to self.
         if p_id == NODE_ID:
             app.logger.debug(f"Skipping broadcast to self (node {NODE_ID}).")
             continue
-
-        # Use IPv6 if available; otherwise, fall back to IPv4.
         if ":" in get_preferred_ip():
             p_ip = peer.get("ipv6") if peer.get("ipv6") else peer.get("ipv4")
         else:
             p_ip = peer.get("ipv4")
-
         app.logger.debug(f"Preparing to broadcast to peer {p_id} at {p_ip}.")
         url = f"http://{format_ip_for_url(p_ip)}:{PORT}/registerPeer"
-        # Updated payload: include both ipv4 and ipv6 addresses.
         public_ipv4, public_ipv6 = get_public_ips()
         payload = {
             "id": p_id,
@@ -403,11 +451,9 @@ def broadcast_peer_to_peers(peer_id, peer_ip):
             "ipv4": public_ipv4,
             "ipv6": public_ipv6
         }
-        headers = {"X-RelayBroadcast": "true"}
         app.logger.debug(f"Broadcast URL: {url} | Payload: {payload}")
-
         try:
-            resp = requests.post(url, json=payload, headers=headers, timeout=5)
+            resp = requests.post(url, json=payload, timeout=5)
             if resp.status_code in (200, 201):
                 app.logger.info(f"Successfully broadcasted {target_role} {p_id} to peer {p_id} at {p_ip}")
             else:
@@ -419,10 +465,6 @@ def broadcast_peer_to_peers(peer_id, peer_ip):
 
 # ==================== Shard Manager (for local sharding if needed) ====================
 def shard_file(file_obj, chunk_size=64*1024):
-    """
-    Splits the uploaded file into shards.
-    Returns a list of tuples: (shard_id, BytesIO object)
-    """
     try:
         content = file_obj.read()
         shards = []
@@ -437,7 +479,6 @@ def shard_file(file_obj, chunk_size=64*1024):
         app.logger.exception("Error while sharding file:")
         raise
 
-# ==================== Flask Endpoints ====================
 @app.route("/")
 def index():
     return jsonify({
@@ -466,7 +507,7 @@ def store():
     is_forwarded = request.headers.get("X-Forwarded", "false").lower() == "true"
     app.logger.debug(f"Is forwarded: {is_forwarded}")
 
-    # --- For forwarded shards (received by Adept nodes) ---
+    # For forwarded shards (received by Adept nodes)
     if is_forwarded:
         if ROLE.lower() != "adept":
             app.logger.error("Relay node received forwarded shard; rejecting.")
@@ -482,7 +523,7 @@ def store():
             app.logger.exception("Error storing forwarded shard:")
             return "Error storing forwarded shard", 500
 
-    # --- Original upload handling ---
+    # Original upload handling
     if ROLE.lower() == "adept":
         try:
             shards = shard_file(file)
@@ -517,7 +558,13 @@ def store():
                 app.logger.error(f"No IP found for adept node {target_uuid} in DHT")
                 return "No adept IP found", 500
 
-            # Use IPv6 if available; otherwise, fall back to IPv4.
+            # Check incoming status; if False, queue job instead of forwarding directly.
+            if not peer_info.get("incoming", True):
+                job = {"shardId": filename, "targetNodeId": target_uuid, "shardFileUrl": f"http://{request.host}/storage/{filename}"}
+                safe_append_job(job)
+                app.logger.debug(f"Queued job for target {target_uuid} because it is behind NAT: {job}")
+                return "Job queued for node behind NAT", 200
+            
             if ":" in get_preferred_ip():
                 target_ip = peer_info.get("ipv6") if peer_info.get("ipv6") else peer_info.get("ipv4")
             else:
@@ -559,91 +606,6 @@ def download():
         app.logger.exception("Error serving file:")
         return "Error serving file", 500
 
-# ------------------ DHT Registration Endpoints ------------------
-@app.route("/registerPeer", methods=["POST"])
-def register_peer():
-    """
-    Endpoint for external nodes to register themselves in the DHT.
-    Expects a JSON payload with at least an 'id' field and optionally 'role', 'ipv4', and 'ipv6' fields.
-    Only peers of the opposite type are added.
-    """
-    data = request.get_json()
-    if not data or "id" not in data:
-        app.logger.error("Missing 'id' in /registerPeer payload.")
-        return jsonify({"error": "Missing 'id' in payload"}), 400
-    node_id = data["id"]
-    role_from_payload = data.get("role", "").lower()
-    ip_address = normalize_ip(data.get("ipv4", request.remote_addr))
-    ipv6_address = normalize_ip(data.get("ipv6", ""))
-    app.logger.debug(f"/registerPeer received payload: {data} (normalized ipv4: {ip_address}, ipv6: {ipv6_address}, remote_addr: {request.remote_addr})")
-
-    if ROLE.lower() == "relay" and role_from_payload == "adept":
-        dht_manager.register_node(node_id, ip_address, ipv6_address, role_from_payload)
-        app.logger.info(f"Registered adept peer {node_id} with IPs {{'ipv4': {ip_address}, 'ipv6': {ipv6_address}}} in DHT.")
-    elif ROLE.lower() == "adept" and role_from_payload == "relay":
-        dht_manager.register_node(node_id, ip_address, ipv6_address, role_from_payload)
-        app.logger.info(f"Registered relay peer {node_id} with IPs {{'ipv4': {ip_address}, 'ipv6': {ipv6_address}}} in DHT.")
-    else:
-        app.logger.info(f"Node {node_id} with role {role_from_payload} not added to our DHT (our role: {ROLE}).")
-    
-    # Broadcast registration if not already a broadcast.
-    if ROLE.lower() == "relay" and role_from_payload == "adept" and not request.headers.get("X-RelayBroadcast"):
-        app.logger.debug(f"Initiating broadcast of adept peer {node_id} from relay node.")
-        broadcast_peer_to_peers(node_id, ip_address)
-    elif ROLE.lower() == "adept" and role_from_payload == "relay" and not request.headers.get("X-RelayBroadcast"):
-        app.logger.debug(f"Initiating broadcast of relay peer {node_id} from adept node.")
-        broadcast_peer_to_peers(node_id, ip_address)
-    
-    return jsonify({"status": "success", "message": f"Peer {node_id} registered."}), 200
-
-@app.route("/updateIp", methods=["POST"])
-def update_ip():
-    """
-    Endpoint for external nodes to update their IP in the DHT.
-    Expects a JSON payload with an 'id' field.
-    Only processes updates for peers of the opposite type.
-    """
-    data = request.get_json()
-    if not data or "id" not in data:
-        app.logger.error("Missing 'id' in /updateIp payload.")
-        return jsonify({"error": "Missing 'id' in payload"}), 400
-    node_id = data["id"]
-    ip_address = normalize_ip(data.get("ipv4", request.remote_addr))
-    ipv6_address = normalize_ip(data.get("ipv6", ""))
-    app.logger.debug(f"/updateIp received for node {node_id} with normalized ipv4: {ip_address}, ipv6: {ipv6_address}")
-    if node_id in dht_manager.peer_nodes:
-        role = "adept" if ROLE.lower() == "relay" else "relay"
-        dht_manager.register_node(node_id, ip_address, ipv6_address, role)
-        app.logger.info(f"Updated IP for peer {node_id} to {{'ipv4': {ip_address}, 'ipv6': {ipv6_address}}} in DHT.")
-    else:
-        app.logger.info(f"Update ignored for node {node_id} (not registered as peer).")
-    return jsonify({"status": "success", "message": f"IP updated for node {node_id}."}), 200
-
-# ==================== DHT Info Endpoint ====================
-@app.route("/dht", methods=["GET"])
-def dht():
-    app.logger.debug("DHT information requested.")
-    return jsonify({
-        "node_map": dht_manager.node_map,
-        "shard_map": dht_manager.shard_map,
-        "peer_nodes": dht_manager.peer_nodes,
-        "current_peer_index": dht_manager.current_peer_index
-    })
-
-@app.route("/getShards", methods=["GET"])
-def get_shards():
-    """
-    Endpoint to retrieve all shard information for a given owner.
-    Expects a query parameter 'owner' with the owner's UUID.
-    """
-    owner_uuid = request.args.get("owner")
-    if not owner_uuid:
-        app.logger.error("Missing 'owner' query parameter in /getShards.")
-        return jsonify({"error": "Missing 'owner' query parameter"}), 400
-    owner_shards = {shard: info for shard, info in dht_manager.shard_map.items() if info.get("owner") == owner_uuid}
-    app.logger.debug(f"Returning shards for owner {owner_uuid}: {owner_shards}")
-    return jsonify(owner_shards), 200
-
 # ==================== Heartbeat Functionality ====================
 SUPABASE_HEARTBEAT_URL = SUPABASE_URL
 headers = {
@@ -681,12 +643,7 @@ def heartbeat_loop(interval=60):
 heartbeat_thread = threading.Thread(target=heartbeat_loop, args=(60,), daemon=True)
 heartbeat_thread.start()
 
-#-----------------DHT UPDAE EVERY 15 MINUTES-----------------------
 def periodic_peer_registration(interval=900):
-    """
-    Periodically query Supabase for new nodes and register this node with their DHTs.
-    This function runs an infinite loop that calls register_with_peers() every 'interval' seconds.
-    """
     while True:
         app.logger.info("Periodic peer registration: Scanning for new nodes...")
         try:
@@ -696,11 +653,156 @@ def periodic_peer_registration(interval=900):
         app.logger.info("Periodic peer registration: Waiting for next scan...")
         time.sleep(interval)
 
-# Start the periodic peer registration in a daemon thread
+peer_reg_thread = threading.Thread(target=periodic_peer_registration, args=(900,), daemon=True)
+peer_reg_thread.start()
+
+# ==================== Adept Node: Polling for Shard Jobs ====================
+def download_and_store_shard(shard_id, shard_file_url):
+    try:
+        r = requests.get(shard_file_url, timeout=5)
+        if r.status_code == 200:
+            destination = os.path.join(STORAGE_DIR, shard_id)
+            with open(destination, "wb") as f:
+                f.write(r.content)
+            app.logger.info(f"Downloaded and stored shard {shard_id} at {destination}")
+            global adept_shard_count
+            adept_shard_count += 1
+            update_shard_count_in_supabase()
+        else:
+            app.logger.error(f"Failed to download shard {shard_id}: {r.status_code} {r.text}")
+    except Exception as e:
+        app.logger.exception(f"Exception downloading shard {shard_id}:")
+
+def poll_for_shard_jobs():
+    while True:
+        if ROLE.lower() == "adept":
+            relay_endpoint = os.environ.get("RELAY_ENDPOINT", "http://localhost:8080")
+            poll_url = f"{relay_endpoint}/pendingJobs?targetId={NODE_ID}"
+            try:
+                r = requests.get(poll_url, timeout=5)
+                if r.status_code == 200:
+                    jobs = r.json().get("jobs", [])
+                    app.logger.debug(f"Polled {len(jobs)} shard jobs for node {NODE_ID}")
+                    for job in jobs:
+                        shard_id = job.get("shardId")
+                        shard_file_url = job.get("shardFileUrl")
+                        if shard_id and shard_file_url:
+                            download_and_store_shard(shard_id, shard_file_url)
+                else:
+                    app.logger.error(f"Failed to poll shard jobs: {r.status_code} {r.text}")
+            except Exception as e:
+                app.logger.exception("Exception polling for shard jobs:")
+        time.sleep(900)
+
+if ROLE.lower() == "adept":
+    shard_poll_thread = threading.Thread(target=poll_for_shard_jobs, daemon=True)
+    shard_poll_thread.start()
+
+# ==================== Broadcast Functionality for Peers ====================
+def broadcast_peer_to_peers(peer_id, peer_ip):
+    target_role = "adept" if ROLE.lower() == "relay" else "relay"
+    app.logger.info(f"Broadcasting {target_role} {peer_id} to all peers from node {NODE_ID}.")
+    peers = query_peers_from_supabase(target_role)
+    for peer in peers:
+        p_id = peer.get("id")
+        if not p_id:
+            app.logger.warning("Encountered a peer without an id during broadcast; skipping.")
+            continue
+        if p_id == NODE_ID:
+            app.logger.debug(f"Skipping broadcast to self (node {NODE_ID}).")
+            continue
+        if ":" in get_preferred_ip():
+            p_ip = peer.get("ipv6") if peer.get("ipv6") else peer.get("ipv4")
+        else:
+            p_ip = peer.get("ipv4")
+        app.logger.debug(f"Preparing to broadcast to peer {p_id} at {p_ip}.")
+        url = f"http://{format_ip_for_url(p_ip)}:{PORT}/registerPeer"
+        public_ipv4, public_ipv6 = get_public_ips()
+        payload = {
+            "id": p_id,
+            "role": target_role.capitalize(),
+            "ipv4": public_ipv4,
+            "ipv6": public_ipv6
+        }
+        app.logger.debug(f"Broadcast URL: {url} | Payload: {payload}")
+        try:
+            resp = requests.post(url, json=payload, timeout=5)
+            if resp.status_code in (200, 201):
+                app.logger.info(f"Successfully broadcasted {target_role} {p_id} to peer {p_id} at {p_ip}")
+            else:
+                app.logger.error(f"Failed broadcasting {target_role} {p_id} to peer {p_id} at {p_ip}: {resp.status_code} - {resp.text}")
+        except requests.exceptions.ConnectionError as ce:
+            app.logger.warning(f"Connection refused when broadcasting {target_role} {p_id} to peer {p_id} at {p_ip}. Details: {ce}")
+        except Exception as e:
+            app.logger.exception(f"Exception broadcasting {target_role} {p_id} to peer {p_id} at {p_ip}")
+
+# ==================== DHT Info Endpoint ====================
+@app.route("/dht", methods=["GET"])
+def dht():
+    app.logger.debug("DHT information requested.")
+    return jsonify({
+        "node_map": dht_manager.node_map,
+        "shard_map": dht_manager.shard_map,
+        "peer_nodes": dht_manager.peer_nodes,
+        "current_peer_index": dht_manager.current_peer_index
+    })
+
+@app.route("/getShards", methods=["GET"])
+def get_shards():
+    owner_uuid = request.args.get("owner")
+    if not owner_uuid:
+        app.logger.error("Missing 'owner' query parameter in /getShards.")
+        return jsonify({"error": "Missing 'owner' query parameter"}), 400
+    owner_shards = {shard: info for shard, info in dht_manager.shard_map.items() if info.get("owner") == owner_uuid}
+    app.logger.debug(f"Returning shards for owner {owner_uuid}: {owner_shards}")
+    return jsonify(owner_shards), 200
+
+# ==================== Heartbeat Functionality ====================
+def send_heartbeat():
+    heartbeat_data = {
+        "id": NODE_ID,
+        "active": True,
+        "last_seen": [datetime.utcnow().isoformat() + "Z"]
+    }
+    try:
+        app.logger.debug(f"Sending heartbeat: {heartbeat_data}")
+        response = requests.patch(
+            f"{SUPABASE_HEARTBEAT_URL}?id=eq.{NODE_ID}",
+            headers=headers,
+            json=heartbeat_data,
+            timeout=5
+        )
+        if response.status_code in (200, 201):
+            app.logger.debug("Heartbeat sent successfully.")
+        else:
+            app.logger.error(f"Heartbeat update failed: {response.status_code} - {response.text}")
+    except Exception as e:
+        app.logger.exception("Exception sending heartbeat:")
+
+def heartbeat_loop(interval=60):
+    while True:
+        send_heartbeat()
+        time.sleep(interval)
+
+heartbeat_thread = threading.Thread(target=heartbeat_loop, args=(60,), daemon=True)
+heartbeat_thread.start()
+
+def periodic_peer_registration(interval=900):
+    while True:
+        app.logger.info("Periodic peer registration: Scanning for new nodes...")
+        try:
+            register_with_peers()
+        except Exception as e:
+            app.logger.exception("Error during periodic peer registration:")
+        app.logger.info("Periodic peer registration: Waiting for next scan...")
+        time.sleep(interval)
+
 peer_reg_thread = threading.Thread(target=periodic_peer_registration, args=(900,), daemon=True)
 peer_reg_thread.start()
 
 if __name__ == "__main__":
+    # Prevent duplicate registration in debug mode.
+    if os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        register_node_in_supabase()
     app.logger.info(f"Starting {ROLE} node with ID: {NODE_ID} on port {PORT}")
-    # Bind to all interfaces (IPv4 and IPv6)
     app.run(host="::", port=PORT, debug=True)
