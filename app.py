@@ -1,4 +1,6 @@
 import os
+import platform
+import subprocess
 import uuid
 import logging
 from io import BytesIO
@@ -78,26 +80,30 @@ def normalize_ip(ip):
 
 def ip_external_reach(ip, port=8080):
     """
-    Uses an external service to check if the given IP and port are reachable.
-    The external ping service is expected to accept 'target' and 'port' as query parameters
-    and return JSON, e.g. {"reachable": true}.
+    Uses the system's 'ping' command to check if the given IP address is reachable.
+    Since ICMP ping does not support port checking, the 'port' parameter is ignored.
+    
+    Returns:
+        True if the ping command receives a reply, otherwise False.
     """
-    target = format_ip_for_url(ip)
-    # Replace with your actual external ping service endpoint.
-    ping_url = f"https://externalping.example.com/ping?target={target}&port={port}"
+    # Determine the correct flag for the ping command based on the operating system.
+    # Windows uses '-n 1' while Linux and macOS use '-c 1' to send a single ping.
+    count_flag = "-n" if platform.system().lower() == "windows" else "-c"
+    
+    # Build the ping command.
+    command = ["ping", count_flag, "1", ip]
+    
     try:
-        app_logger.debug(f"External ping URL: {ping_url}")
-        response = requests.get(ping_url, timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            reachable = data.get("reachable", False)
-            app_logger.debug(f"External ping result for {ip}: {reachable}")
-            return reachable
-        else:
-            app_logger.error(f"External ping error ({response.status_code}): {response.text}")
-            return False
+        # Execute the ping command. If the command returns 0, it is considered reachable.
+        output = subprocess.check_output(command, stderr=subprocess.STDOUT, universal_newlines=True, timeout=5)
+        # Optionally, you can add further parsing of `output` to check for specific text like "Reply from"
+        # if needed. For now, a successful execution is considered a reachable result.
+        return True
+    except subprocess.CalledProcessError:
+        # The ping command failed (non-zero return code).
+        return False
     except Exception as e:
-        app_logger.exception(f"Exception during external ping for {ip}:")
+        # In case of any other exception (e.g., timeout), assume the IP is unreachable.
         return False
 
 def discover_external_ip_info(port=PORT):
