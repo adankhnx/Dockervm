@@ -76,7 +76,7 @@ def normalize_ip(ip):
         return ip.replace("::ffff:", "")
     return ip
 
-def ip_external_reach(ip, port=PORT):
+def ip_external_reach(ip, port=8080):
     """
     Uses an external service to check if the given IP and port are reachable.
     The external ping service is expected to accept 'target' and 'port' as query parameters
@@ -124,7 +124,7 @@ def discover_external_ip_info(port=PORT):
     except Exception as e:
         app_logger.exception("Error fetching public IPv4 address:")
 
-    # Discover external IPv6 using api64.ipify.org.
+    # Discover external IPv6 using api6.ipify.org.
     try:
         response_ipv6 = requests.get("https://api6.ipify.org", timeout=2)
         if response_ipv6.status_code == 200:
@@ -135,18 +135,25 @@ def discover_external_ip_info(port=PORT):
 
     # Check reachability using the external ping service.
     incoming = False
+
     if ipv4 and ipv4 != "Unknown":
-        incoming = ip_external_reach(ipv4, port)
-        app_logger.debug(f"IPv4 reachable (incoming): {incoming}")
-    elif ipv6:
-        incoming = ip_external_reach(ipv6, port)
-        app_logger.debug(f"IPv6 reachable (incoming): {incoming}")
+        ipv4_reachable = ip_external_reach(ipv4, port)
+        app_logger.debug(f"IPv4 reachable: {ipv4_reachable}")
+        if ipv4_reachable:
+            incoming = True
+
+    if ipv6:
+        ipv6_reachable = ip_external_reach(ipv6, port)
+        app_logger.debug(f"IPv6 reachable: {ipv6_reachable}")
+        if ipv6_reachable:
+            incoming = True
 
     return {
         "ipv4": ipv4 if ipv4 else "Unknown",
         "ipv6": ipv6 if ipv6 else "",
         "incoming": incoming
     }
+
 
 # ----------------------- Initialize Our Own External IP Variables -----------------------
 ip_info = discover_external_ip_info(port=PORT)
