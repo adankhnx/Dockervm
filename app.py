@@ -106,17 +106,17 @@ def ip_external_reach(ip, port=8080):
         # In case of any other exception (e.g., timeout), assume the IP is unreachable.
         return False
 
-def discover_external_ip_info(port=PORT):
+def discover_external_ip_info(port=8080):
     """
     Discovers external IPv4 and IPv6 addresses using external services,
     normalizes them using helper functions, and then checks reachability
-    using an external ping service.
+    using a local ping command.
 
     Returns a dictionary:
       {
          "ipv4": <IPv4 address or "Unknown">,
          "ipv6": <IPv6 address or "">,
-         "incoming": <True if reachable, else False>
+         "incoming": <True if at least one is reachable, else False>
       }
     """
     ipv4, ipv6 = None, None
@@ -127,6 +127,8 @@ def discover_external_ip_info(port=PORT):
         if response_ipv4.status_code == 200:
             ipv4 = normalize_ip(response_ipv4.text.strip())
             app_logger.debug(f"Discovered external IPv4: {ipv4}")
+        else:
+            app_logger.error(f"IPv4 service returned status {response_ipv4.status_code}")
     except Exception as e:
         app_logger.exception("Error fetching public IPv4 address:")
 
@@ -136,18 +138,23 @@ def discover_external_ip_info(port=PORT):
         if response_ipv6.status_code == 200:
             ipv6 = normalize_ip(response_ipv6.text.strip())
             app_logger.debug(f"Discovered external IPv6: {ipv6}")
+        else:
+            app_logger.error(f"IPv6 service returned status {response_ipv6.status_code}")
     except Exception as e:
+        # If we encounter an error (e.g. network unreachable), log and move on.
         app_logger.exception("Error fetching public IPv6 address:")
+        ipv6 = None
 
-    # Check reachability using the external ping service.
     incoming = False
 
+    # Check IPv4 reachability (if we got a valid IPv4)
     if ipv4 and ipv4 != "Unknown":
         ipv4_reachable = ip_external_reach(ipv4, port)
         app_logger.debug(f"IPv4 reachable: {ipv4_reachable}")
         if ipv4_reachable:
             incoming = True
 
+    # Check IPv6 reachability only if we have an IPv6 address.
     if ipv6:
         ipv6_reachable = ip_external_reach(ipv6, port)
         app_logger.debug(f"IPv6 reachable: {ipv6_reachable}")
