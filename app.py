@@ -78,32 +78,26 @@ def normalize_ip(ip):
         return ip.replace("::ffff:", "")
     return ip
 
-def ip_external_reach(ip, port=8080):
+import socket
+
+def ip_external_reach(ip, port=8080, timeout=5):
     """
-    Uses the system's 'ping' command to check if the given IP address is reachable.
-    Since ICMP ping does not support port checking, the 'port' parameter is ignored.
+    Uses a TCP connection attempt to check if the given IP address is reachable on the specified port.
+    
+    Args:
+        ip (str): The target IP address.
+        port (int): The port number to test.
+        timeout (int): Timeout in seconds for the connection attempt.
     
     Returns:
-        True if the ping command receives a reply, otherwise False.
+        bool: True if a TCP connection is established, otherwise False.
     """
-    # Determine the correct flag for the ping command based on the operating system.
-    # Windows uses '-n 1' while Linux and macOS use '-c 1' to send a single ping.
-    count_flag = "-n" if platform.system().lower() == "windows" else "-c"
-    
-    # Build the ping command.
-    command = ["ping", count_flag, "1", ip]
-    
     try:
-        # Execute the ping command. If the command returns 0, it is considered reachable.
-        output = subprocess.check_output(command, stderr=subprocess.STDOUT, universal_newlines=True, timeout=5)
-        # Optionally, you can add further parsing of `output` to check for specific text like "Reply from"
-        # if needed. For now, a successful execution is considered a reachable result.
-        return True
-    except subprocess.CalledProcessError:
-        # The ping command failed (non-zero return code).
-        return False
-    except Exception as e:
-        # In case of any other exception (e.g., timeout), assume the IP is unreachable.
+        # Attempt to create a TCP connection to the specified IP and port.
+        with socket.create_connection((ip, port), timeout=timeout) as sock:
+            return True
+    except (socket.timeout, socket.error) as e:
+        # Could not connect, so the IP/port is considered unreachable.
         return False
 
 def discover_external_ip_info(port=8080):
