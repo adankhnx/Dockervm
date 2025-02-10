@@ -388,7 +388,7 @@ def register_with_peers():
                     "ipv6": public_ipv6
                 }
                 app_logger.debug(f"Sending registration to {url} with payload: {payload}")
-                resp = requests.post(url, json=payload, timeout=5)
+                resp = requests.post(url, json=payload, timeout=20)
                 if resp.status_code in (200, 201):
                     registered_peers.append({"id": peer_id, "ip": peer_ip})
                     app_logger.info(f"Registered with {target_role} node {peer_id} at {peer_ip}")
@@ -537,7 +537,7 @@ def broadcast_peer_to_peers(peer_id, peer_ip):
         }
         app_logger.debug(f"Broadcast URL: {url} | Payload: {payload}")
         try:
-            resp = requests.post(url, json=payload, timeout=5)
+            resp = requests.post(url, json=payload, timeout=20)
             if resp.status_code in (200, 201):
                 app_logger.info(f"Successfully broadcasted {target_role} {p_id} to peer {p_id} at {p_ip}")
             else:
@@ -588,10 +588,11 @@ def store():
     filename = secure_filename(file.filename)
     app_logger.debug(f"Received file: {filename}")
 
-    is_forwarded = request.headers.get("X-Forwarded", "false").lower() == "true"
-    app_logger.debug(f"Is forwarded: {is_forwarded}")
+    # Check for our custom header "X-OriginalUploader"
+    is_forwarded = request.headers.get("X-OriginalUploader", "false").lower() == "true"
+    app_logger.debug(f"Is forwarded (X-OriginalUploader): {is_forwarded}")
 
-    # For forwarded shards (received by Adept nodes)
+    # If the file is forwarded (i.e. coming from a Relay or forwarded by an Adept)
     if is_forwarded:
         if ROLE.lower() != "adept":
             app_logger.error("Relay node received forwarded shard; rejecting.")
@@ -607,17 +608,18 @@ def store():
             app_logger.exception("Error storing forwarded shard:")
             return "Error storing forwarded shard", 500
 
-    # Original upload handling
+    # Original upload handling: not forwarded, so process as an original upload.
     if ROLE.lower() == "adept":
         try:
             shards = shard_file(file)
             relay_endpoint = os.environ.get("RELAY_ENDPOINT", "http://localhost:8080")
             for shard_id, shard_stream in shards:
                 files = {"file": (f"{filename}_{shard_id}", shard_stream, "application/octet-stream")}
-                headers = {"X-Forwarded": "true", "X-Owner": NODE_ID}
+                # Mark this upload as original by setting X-OriginalUploader to false.
+                headers = {"X-OriginalUploader": "false", "X-Owner": NODE_ID}
                 app_logger.debug(f"Forwarding shard {shard_id} to relay endpoint {relay_endpoint}/store with headers: {headers}")
                 try:
-                    r = requests.post(f"{relay_endpoint}/store", files=files, headers=headers, timeout=5)
+                    r = requests.post(f"{relay_endpoint}/store", files=files, headers=headers, timeout=20)
                     if r.status_code != 200:
                         app_logger.error(f"Error forwarding shard {shard_id}: {r.status_code} - {r.text}")
                 except Exception as e:
@@ -656,7 +658,7 @@ def store():
             target_adept_endpoint = f"http://{format_ip_for_url(target_ip)}:{PORT}"
             app_logger.debug(f"Forwarding file from Relay to Adept at endpoint: {target_adept_endpoint}/store")
             try:
-                r = requests.post(f"{target_adept_endpoint}/store", files=files, headers={"X-Forwarded": "true"}, timeout=5)
+                r = requests.post(f"{target_adept_endpoint}/store", files=files, headers={"X-OriginalUploader": "false"}, timeout=20)
                 if r.status_code == 200:
                     dht_manager.register_shard(filename, owner_uuid, target_uuid)
                     return "File forwarded to Adept", 200
@@ -743,7 +745,7 @@ peer_reg_thread.start()
 # ----------------------- Adept Node: Polling for Shard Jobs -----------------------
 def download_and_store_shard(shard_id, shard_file_url):
     try:
-        r = requests.get(shard_file_url, timeout=5)
+        r = requests.get(shard_file_url, timeout=20)
         if r.status_code == 200:
             destination = os.path.join(STORAGE_DIR, shard_id)
             with open(destination, "wb") as f:
@@ -763,7 +765,7 @@ def poll_for_shard_jobs():
             relay_endpoint = os.environ.get("RELAY_ENDPOINT", "http://localhost:8080")
             poll_url = f"{relay_endpoint}/pendingJobs?targetId={NODE_ID}"
             try:
-                r = requests.get(poll_url, timeout=5)
+                r = requests.get(poll_url, timeout=15)
                 if r.status_code == 200:
                     jobs = r.json().get("jobs", [])
                     app_logger.debug(f"Polled {len(jobs)} shard jobs for node {NODE_ID}")
