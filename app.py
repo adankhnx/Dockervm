@@ -92,18 +92,15 @@ def ip_external_reach(ip, port=8080, timeout=5):
         bool: True if a TCP connection is established, otherwise False.
     """
     try:
-        # Attempt to create a TCP connection to the specified IP and port.
         with socket.create_connection((ip, port), timeout=timeout) as sock:
             return True
     except (socket.timeout, socket.error) as e:
-        # Could not connect, so the IP/port is considered unreachable.
         return False
 
 def discover_external_ip_info(port=8080):
     """
     Discovers external IPv4 and IPv6 addresses using external services,
-    normalizes them using helper functions, and then checks reachability
-    using a local ping command.
+    normalizes them, and checks reachability.
 
     Returns a dictionary:
       {
@@ -114,7 +111,6 @@ def discover_external_ip_info(port=8080):
     """
     ipv4, ipv6 = None, None
 
-    # Discover external IPv4 using api.ipify.org.
     try:
         response_ipv4 = requests.get("https://api.ipify.org", timeout=2)
         if response_ipv4.status_code == 200:
@@ -125,7 +121,6 @@ def discover_external_ip_info(port=8080):
     except Exception as e:
         app_logger.exception("Error fetching public IPv4 address:")
 
-    # Discover external IPv6 using api6.ipify.org.
     try:
         response_ipv6 = requests.get("https://api6.ipify.org", timeout=2)
         if response_ipv6.status_code == 200:
@@ -138,15 +133,11 @@ def discover_external_ip_info(port=8080):
         ipv6 = None
 
     incoming = False
-
-    # Check IPv4 reachability (if we got a valid IPv4)
     if ipv4 and ipv4 != "Unknown":
         ipv4_reachable = ip_external_reach(ipv4, port)
         app_logger.debug(f"IPv4 reachable: {ipv4_reachable}")
         if ipv4_reachable:
             incoming = True
-
-    # Check IPv6 reachability only if we have an IPv6 address.
     if ipv6:
         ipv6_reachable = ip_external_reach(ipv6, port)
         app_logger.debug(f"IPv6 reachable: {ipv6_reachable}")
@@ -159,12 +150,11 @@ def discover_external_ip_info(port=8080):
         "incoming": incoming
     }
 
-# ----------------------- Initialize Our Own External IP Variables -----------------------
+# ----------------------- Initialize External IP Variables -----------------------
 ip_info = discover_external_ip_info(port=PORT)
 public_ipv4 = ip_info["ipv4"]
 public_ipv6 = ip_info["ipv6"]
 incoming = ip_info["incoming"]
-
 app_logger.debug(f"Own IP discovery: Public IPv4: {public_ipv4}, Public IPv6: {public_ipv6}, Incoming: {incoming}")
 
 # ----------------------- IP Address & Role Determination (Local) -----------------------
@@ -195,7 +185,6 @@ def get_ipv6_addresses():
     return ipv6_list
 
 def get_public_ipv4():
-    # Fallback: use external service if needed.
     try:
         response = requests.get("https://api.ipify.org", timeout=2)
         if response.status_code == 200:
@@ -220,7 +209,6 @@ def get_public_ipv6():
     return None
 
 def get_public_ips():
-    """Return a tuple (ipv4, ipv6) based on public queries (with fallback to local addresses)."""
     ipv4 = get_public_ipv4()
     if not ipv4:
         ipv4s = get_ipv4_addresses()
@@ -233,7 +221,6 @@ def get_public_ips():
     return ipv4, ipv6
 
 def get_preferred_ip():
-    """Returns the preferred IP address for communication, prioritizing IPv6."""
     ipv4, ipv6 = get_public_ips()
     if ipv6:
         app_logger.debug(f"Preferred IP (IPv6): {ipv6}")
@@ -242,7 +229,6 @@ def get_preferred_ip():
     return ipv4
 
 def determine_role():
-    """Auto-detect role based on presence of non-loopback IPv6 addresses."""
     ipv6s = get_ipv6_addresses()
     if ipv6s:
         app_logger.info("Determined node role as Relay based on available IPv6 addresses.")
@@ -276,15 +262,11 @@ def update_shard_count_in_supabase():
 def register_node_in_supabase():
     app_logger.info(">> Starting Supabase registration")
     app_logger.info(f"SUPABASE_URL: {SUPABASE_URL}, SUPABASE_API_KEY: {SUPABASE_API_KEY}")
-    
-    # Use the consolidated IP discovery function to obtain IP info and reachability.
     ip_info = discover_external_ip_info(port=PORT)
     public_ipv4 = ip_info["ipv4"]
     public_ipv6 = ip_info["ipv6"]
     incoming = ip_info["incoming"]
-    
     app_logger.info(f"Discovered public IPv4: {public_ipv4}, public IPv6: {public_ipv6}, incoming: {incoming}")
-
     data = {
         "id": NODE_ID,
         "nickname": NODE_NICKNAME,
@@ -359,22 +341,20 @@ def register_with_peers():
     app_logger.info(f"Attempting to register with {target_role} nodes.")
     peers = query_peers_from_supabase(target_role)
     for peer in peers:
-        peer_id = peer.get("id")
-        if not peer_id:
+        p_id = peer.get("id")
+        if not p_id:
             app_logger.warning("Peer without an id found; skipping.")
             continue
-        if peer_id == NODE_ID:
-            app_logger.debug(f"Skipping self-registration for node {peer_id}")
+        if p_id == NODE_ID:
+            app_logger.debug(f"Skipping self-registration for node {p_id}")
             continue
-        # Determine the preferred IP for the peer.
         if ":" in get_preferred_ip():
             peer_ip = peer.get("ipv6") if peer.get("ipv6") else peer.get("ipv4")
         else:
             peer_ip = peer.get("ipv4")
-        if peer_ip and peer_id:
+        if peer_ip and p_id:
             try:
                 url = f"http://{format_ip_for_url(peer_ip)}:{PORT}/registerPeer"
-                # Use the consolidated IP discovery for our own registration payload.
                 ip_info = discover_external_ip_info(port=PORT)
                 public_ipv4 = ip_info["ipv4"]
                 public_ipv6 = ip_info["ipv6"]
@@ -387,12 +367,12 @@ def register_with_peers():
                 app_logger.debug(f"Sending registration to {url} with payload: {payload}")
                 resp = requests.post(url, json=payload, timeout=20)
                 if resp.status_code in (200, 201):
-                    registered_peers.append({"id": peer_id, "ip": peer_ip})
-                    app_logger.info(f"Registered with {target_role} node {peer_id} at {peer_ip}")
+                    registered_peers.append({"id": p_id, "ip": peer_ip})
+                    app_logger.info(f"Registered with {target_role} node {p_id} at {peer_ip}")
                 else:
-                    app_logger.error(f"Failed to register with {target_role} node {peer_id} at {peer_ip}: {resp.status_code} - {resp.text}")
+                    app_logger.error(f"Failed to register with {target_role} node {p_id} at {peer_ip}: {resp.status_code} - {resp.text}")
             except Exception as e:
-                app_logger.exception(f"Exception registering with {target_role} node {peer_id} at {peer_ip}")
+                app_logger.exception(f"Exception registering with {target_role} node {p_id} at {peer_ip}")
         else:
             app_logger.error(f"Missing IP or ID for peer: {peer}")
 
@@ -483,7 +463,6 @@ def register_peer():
     role_from_payload = data.get("role", "").lower()
     ip_address = normalize_ip(data.get("ipv4", request.remote_addr))
     ipv6_address = normalize_ip(data.get("ipv6", ""))
-    # Use a simple local reachability test here (could be enhanced as needed)
     incoming_status = ip_external_reach(ip_address)  
     app_logger.debug(f"/registerPeer received payload: {data} (normalized ipv4: {ip_address}, ipv6: {ipv6_address}, incoming: {incoming_status})")
 
@@ -535,13 +514,12 @@ def broadcast_peer_to_peers(peer_id, peer_ip):
             p_ip = peer.get("ipv4")
         app_logger.debug(f"Preparing to broadcast to peer {p_id} at {p_ip}.")
         url = f"http://{format_ip_for_url(p_ip)}:{PORT}/registerPeer"
-        # Use our consolidated IP discovery for our registration payload.
         ip_info = discover_external_ip_info(port=PORT)
         public_ipv4 = ip_info["ipv4"]
         public_ipv6 = ip_info["ipv6"]
         payload = {
-            "id": p_id,
-            "role": target_role.capitalize(),
+            "id": NODE_ID,
+            "role": ROLE.capitalize(),
             "ipv4": public_ipv4,
             "ipv6": public_ipv6
         }
@@ -607,7 +585,11 @@ def store():
         if ROLE.lower() != "adept":
             app_logger.error("Relay node received forwarded shard; rejecting.")
             return "Relay nodes do not store forwarded shards", 403
-        destination = os.path.join(STORAGE_DIR, filename)
+        # Save the forwarded shard in the replicated_shards folder.
+        replicated_dir = os.path.join(STORAGE_DIR, "replicated_shards")
+        if not os.path.exists(replicated_dir):
+            os.makedirs(replicated_dir)
+        destination = os.path.join(replicated_dir, filename)
         try:
             file.save(destination)
             app_logger.info(f"Stored forwarded shard locally at: {destination}")
@@ -644,7 +626,6 @@ def store():
         try:
             content = file.read()
             files = {"file": (filename, BytesIO(content), file.content_type)}
-            # Use the new function to exclude the owner node.
             target_uuid = dht_manager.find_available_peer_node_excluding(owner_uuid)
             if not target_uuid:
                 app_logger.error("No available adept node found in DHT (after excluding the owner).")
@@ -655,7 +636,6 @@ def store():
                 app_logger.error(f"No IP found for adept node {target_uuid} in DHT")
                 return "No adept IP found", 500
 
-            # Check incoming status; if False, queue job instead of forwarding directly.
             if not peer_info.get("incoming", True):
                 job = {"shardId": filename, "targetNodeId": target_uuid, "shardFileUrl": f"http://{request.host}/storage/{filename}"}
                 safe_append_job(job)
@@ -669,7 +649,8 @@ def store():
             target_adept_endpoint = f"http://{format_ip_for_url(target_ip)}:{PORT}"
             app_logger.debug(f"Forwarding file from Relay to Adept at endpoint: {target_adept_endpoint}/store")
             try:
-                r = requests.post(f"{target_adept_endpoint}/store", files=files, headers={"X-OriginalUploader": "false"}, timeout=20)
+                # IMPORTANT: Set header "X-OriginalUploader" to "true" so the receiving Adept does not re-shard.
+                r = requests.post(f"{target_adept_endpoint}/store", files=files, headers={"X-OriginalUploader": "true"}, timeout=20)
                 if r.status_code == 200:
                     dht_manager.register_shard(filename, owner_uuid, target_uuid)
                     return "File forwarded to Adept", 200
