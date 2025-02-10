@@ -12,6 +12,7 @@ import threading
 import time
 from datetime import datetime
 import ipaddress  # <-- for NAT checks if needed
+import socket
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.DEBUG)
@@ -78,8 +79,6 @@ def normalize_ip(ip):
         return ip.replace("::ffff:", "")
     return ip
 
-import socket
-
 def ip_external_reach(ip, port=8080, timeout=5):
     """
     Uses a TCP connection attempt to check if the given IP address is reachable on the specified port.
@@ -135,7 +134,6 @@ def discover_external_ip_info(port=8080):
         else:
             app_logger.error(f"IPv6 service returned status {response_ipv6.status_code}")
     except Exception as e:
-        # If we encounter an error (e.g. network unreachable), log and move on.
         app_logger.exception("Error fetching public IPv6 address:")
         ipv6 = None
 
@@ -160,7 +158,6 @@ def discover_external_ip_info(port=8080):
         "ipv6": ipv6 if ipv6 else "",
         "incoming": incoming
     }
-
 
 # ----------------------- Initialize Our Own External IP Variables -----------------------
 ip_info = discover_external_ip_info(port=PORT)
@@ -444,6 +441,19 @@ class DHTManager:
         app_logger.debug(f"[DHTManager] Current shard map: {self.shard_map}")
         return self.shard_map.copy()
 
+    def find_available_peer_node_excluding(self, exclude_id):
+        if not self.peer_nodes:
+            app_logger.warning("[DHTManager] No peer nodes available!")
+            return None
+        available_nodes = [node for node in self.peer_nodes if node != exclude_id]
+        if not available_nodes:
+            app_logger.warning("[DHTManager] No available peer nodes after excluding the owner.")
+            return None
+        node_uuid = available_nodes[self.current_peer_index % len(available_nodes)]
+        self.current_peer_index = (self.current_peer_index + 1) % len(available_nodes)
+        app_logger.debug(f"[DHTManager] Selected peer node (excluding {exclude_id}): {node_uuid}")
+        return node_uuid
+
     def find_available_peer_node(self):
         if not self.peer_nodes:
             app_logger.warning("[DHTManager] No peer nodes available!")
@@ -634,9 +644,10 @@ def store():
         try:
             content = file.read()
             files = {"file": (filename, BytesIO(content), file.content_type)}
-            target_uuid = dht_manager.find_available_peer_node()
+            # Use the new function to exclude the owner node.
+            target_uuid = dht_manager.find_available_peer_node_excluding(owner_uuid)
             if not target_uuid:
-                app_logger.error("No available adept node found in DHT")
+                app_logger.error("No available adept node found in DHT (after excluding the owner).")
                 return "No available adept node", 500
 
             peer_info = dht_manager.node_map.get(target_uuid)
