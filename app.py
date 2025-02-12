@@ -580,7 +580,7 @@ def store():
     is_forwarded = request.headers.get("X-OriginalUploader", "false").lower() == "true"
     app_logger.debug(f"Is forwarded (X-OriginalUploader): {is_forwarded}")
 
-    # If the file is forwarded (i.e. coming from a Relay or forwarded by an Adept)
+    # ------------------ Forwarded File Handling ------------------
     if is_forwarded:
         if ROLE.lower() != "adept":
             app_logger.error("Relay node received forwarded shard; rejecting.")
@@ -595,16 +595,19 @@ def store():
             app_logger.info(f"Stored forwarded shard locally at: {destination}")
             adept_shard_count += 1
             update_shard_count_in_supabase()
-            return "Forwarded shard stored successfully", 200
+            # For forwarded uploads, we simply return a success response.
+            return jsonify({"message": "Forwarded shard stored successfully"}), 200
         except Exception as e:
             app_logger.exception("Error storing forwarded shard:")
             return "Error storing forwarded shard", 500
 
-    # Original upload handling: not forwarded, so process as an original upload.
+    # ------------------ Original Upload Handling ------------------
+    # For an original upload, if the node is Adept, we shard the file and forward each shard to Relay.
     if ROLE.lower() == "adept":
         try:
             shards = shard_file(file)
             relay_endpoint = os.environ.get("RELAY_ENDPOINT", "http://localhost:8080")
+            mapping = {}  # To collect shard -> redundant adept UUID pairs.
             for shard_id, shard_stream in shards:
                 files = {"file": (f"{filename}_{shard_id}", shard_stream, "application/octet-stream")}
                 # Mark this upload as original by setting X-OriginalUploader to false.
@@ -612,15 +615,19 @@ def store():
                 app_logger.debug(f"Forwarding shard {shard_id} to relay endpoint {relay_endpoint}/store with headers: {headers}")
                 try:
                     r = requests.post(f"{relay_endpoint}/store", files=files, headers=headers, timeout=20)
-                    if r.status_code != 200:
+                    if r.status_code == 200:
+                        resp_json = r.json()  # Expecting {"shard": <shard>, "redundant_adept": <UUID>}
+                        mapping[resp_json.get("shard", f"{filename}_{shard_id}")] = resp_json.get("redundant_adept")
+                    else:
                         app_logger.error(f"Error forwarding shard {shard_id}: {r.status_code} - {r.text}")
                 except Exception as e:
                     app_logger.exception(f"Exception forwarding shard {shard_id}: {e}")
-            return "File sharded and forwarded to Relay", 200
+            return jsonify(mapping), 200
         except Exception as e:
             app_logger.exception("Exception during file sharding and forwarding:")
             return "Error processing file", 500
 
+    # For Relay node handling of original uploads.
     elif ROLE.lower() == "relay":
         owner_uuid = request.headers.get("X-Owner", "unknown")
         try:
@@ -653,7 +660,8 @@ def store():
                 r = requests.post(f"{target_adept_endpoint}/store", files=files, headers={"X-OriginalUploader": "true"}, timeout=20)
                 if r.status_code == 200:
                     dht_manager.register_shard(filename, owner_uuid, target_uuid)
-                    return "File forwarded to Adept", 200
+                    # Return a JSON object with the shard name and the redundant adept's UUID.
+                    return jsonify({"shard": filename, "redundant_adept": target_uuid}), 200
                 else:
                     app_logger.error(f"Error forwarding file to Adept: {r.status_code} - {r.text}")
                     return f"Error: {r.text}", 500
